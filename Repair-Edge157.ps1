@@ -20,7 +20,14 @@
          <version>.x86bad (nothing is deleted, so you can roll back), then installs fresh.
          Renaming first matters: an in-place MSI repair skips files whose version already
          matches, which leaves the 32-bit files in place.
-      3. Re-checks both products and test-launches Edge headless.
+      3. Also broken: the registered version has no folder (Edge: the launcher's version; WebView2: the
+         version registered with EdgeUpdate). This happens when an earlier repair was interrupted after
+         the rename. WebView2 then gets a fresh install with its EdgeUpdate registration exported to a
+         .reg file first and restored if the install does not take.
+      4. Re-checks both products and test-launches Edge headless.
+
+    v5 (2026-11-09): WebView2 registered-version check and fresh-install fallback; never renames an
+    older healthy WebView2 folder.
 
     Run as Administrator or SYSTEM (RMM). Windows PowerShell 5.1 or later. x64 Windows only.
     Running it will close Edge and any app using WebView2 (Teams, Outlook...) on the PC
@@ -81,24 +88,43 @@ function Get-Machine([string]$Path) {
     } catch { '?' }
 }
 
+$WV2Guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+$WV2Keys = @("HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$WV2Guid",
+             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\$WV2Guid")
+
+function Get-WebView2Registered {
+    # Machine-wide WebView2 Runtime version as registered with EdgeUpdate.
+    (Get-ItemProperty $WV2Keys[0] -Name pv -ErrorAction SilentlyContinue).pv
+}
+
 function Get-InstallState($Product) {
     $ver = Get-ChildItem $Product.Root -Directory -ErrorAction SilentlyContinue |
         Where-Object Name -match '^\d+\.\d+\.\d+\.\d+$' |
         Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
     # The launcher (Application\msedge.exe) loads the folder matching its own version.
     # If that folder is missing, Windows reports "side-by-side configuration is incorrect".
-    $launcher = Join-Path $Product.Root 'msedge.exe'
-    $want = if (Test-Path $launcher) { (Get-Item $launcher).VersionInfo.ProductVersion } else { $null }
-    $orphan = $want -and -not (Test-Path (Join-Path $Product.Root "$want\$($Product.Main)"))
-    if (-not $ver) { return [pscustomobject]@{ Folder = $null; Bad = [bool]$orphan; X86Bad = $false; Want = $want; Summary = "no version folder (launcher v$want)" } }
+    # WebView2 has no launcher: apps find it through the version registered with EdgeUpdate (pv).
+    # If that folder is missing, apps report "can't find a required component... Get Edge WebView2"
+    # and the WebView2 installer says it is already installed.
+    if ($Product.Name -eq 'WebView2') {
+        $want = Get-WebView2Registered
+        $from = 'registered'
+    } else {
+        $launcher = Join-Path $Product.Root 'msedge.exe'
+        $want = if (Test-Path $launcher) { (Get-Item $launcher).VersionInfo.ProductVersion } else { $null }
+        $from = 'launcher'
+    }
+    $orphan = [bool]($want -and -not (Test-Path (Join-Path $Product.Root "$want\$($Product.Main)")))
+    if (-not $ver) { return [pscustomobject]@{ Folder = $null; Bad = $orphan; X86Bad = $false; Orphan = $orphan; Want = $want; Summary = "no version folder ($from v$want)" } }
     $files = Get-ChildItem $ver.FullName -Recurse -Include *.dll, *.exe -File -ErrorAction SilentlyContinue
     $x86 = @($files | Where-Object { (Get-Machine $_.FullName) -eq '14C' }).Count
     $main = Get-Machine (Join-Path $ver.FullName $Product.Main)
     $s = "v$($ver.Name) x86 files=$x86/$($files.Count) $($Product.Main)=$main"
-    if ($orphan) { $s += " | launcher v$want has no folder" }
+    if ($orphan) { $s += " | $from v$want has no folder" }
     [pscustomobject]@{
         Folder  = $ver
         Want    = $want
+        Orphan  = $orphan
         X86Bad  = ($x86 -gt 5 -or $main -eq '14C')
         Bad     = ($x86 -gt 5 -or $main -eq '14C' -or $orphan)
         Summary = $s
@@ -203,10 +229,36 @@ function Repair-WebView2($Product, $State) {
     Write-Output '  downloading WebView2 Runtime Evergreen standalone x64'
     Save-SignedFile 'https://go.microsoft.com/fwlink/?linkid=2124701' $exe
     Stop-EdgeServices
-    Stop-Holders $State.Folder.FullName
-    if (-not (Move-BadFolder $State)) { $script:needBoot = $true; return }
+    Stop-Holders $Product.Root
+    Get-Process -Name $HostNames -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Only rename a folder that actually holds the broken files (not an older healthy one).
+    if ($State.Folder -and $State.X86Bad -and -not (Move-BadFolder $State)) { $script:needBoot = $true; return }
     $p = Start-Process $exe -ArgumentList '/silent /install' -Wait -PassThru
     Write-Output ("  installer exit 0x{0:X}" -f $p.ExitCode)
+    if (-not (Get-InstallState $Product).Orphan) { return }
+    # Still registered to a version with no folder: the installer saw "already installed" and did nothing.
+    # Export the EdgeUpdate registration, remove it, install fresh. Put it back if that fails too.
+    Write-Output '  registered version still has no folder: fresh install'
+    $saved = @()
+    $i = 0
+    foreach ($k in $WV2Keys) {
+        if (-not (Test-Path $k)) { continue }
+        $i++
+        $reg = Join-Path $work ("webview2-reg-{0}-{1:yyyyMMddHHmmss}.reg" -f $i, (Get-Date))
+        & reg.exe export ($k -replace '^HKLM:', 'HKLM') $reg /y | Out-Null
+        if (-not (Test-Path $reg)) { Write-Output "  could not export $k; not removing it"; return }
+        Remove-Item $k -Recurse -Force -ErrorAction SilentlyContinue
+        $saved += $reg
+    }
+    Write-Output "  registration exported to $work and removed ($($saved.Count) keys)"
+    Stop-EdgeServices
+    $p = Start-Process $exe -ArgumentList '/silent /install' -Wait -PassThru
+    Write-Output ("  fresh install exit 0x{0:X}" -f $p.ExitCode)
+    $after = Get-InstallState $Product
+    if (-not (Get-WebView2Registered) -or $after.Orphan) {
+        foreach ($reg in $saved) { & reg.exe import $reg 2>&1 | Out-Null }
+        Write-Output '  fresh install did not register a working version: registration restored'
+    }
 }
 
 Write-Output "Repair-Edge157 on $env:COMPUTERNAME $(if ($CheckOnly) {'(check only)'})"
