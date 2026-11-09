@@ -85,14 +85,23 @@ function Get-InstallState($Product) {
     $ver = Get-ChildItem $Product.Root -Directory -ErrorAction SilentlyContinue |
         Where-Object Name -match '^\d+\.\d+\.\d+\.\d+$' |
         Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
-    if (-not $ver) { return [pscustomobject]@{ Folder = $null; Bad = $false; Summary = 'not installed' } }
+    # The launcher (Application\msedge.exe) loads the folder matching its own version.
+    # If that folder is missing, Windows reports "side-by-side configuration is incorrect".
+    $launcher = Join-Path $Product.Root 'msedge.exe'
+    $want = if (Test-Path $launcher) { (Get-Item $launcher).VersionInfo.ProductVersion } else { $null }
+    $orphan = $want -and -not (Test-Path (Join-Path $Product.Root "$want\$($Product.Main)"))
+    if (-not $ver) { return [pscustomobject]@{ Folder = $null; Bad = [bool]$orphan; X86Bad = $false; Want = $want; Summary = "no version folder (launcher v$want)" } }
     $files = Get-ChildItem $ver.FullName -Recurse -Include *.dll, *.exe -File -ErrorAction SilentlyContinue
     $x86 = @($files | Where-Object { (Get-Machine $_.FullName) -eq '14C' }).Count
     $main = Get-Machine (Join-Path $ver.FullName $Product.Main)
+    $s = "v$($ver.Name) x86 files=$x86/$($files.Count) $($Product.Main)=$main"
+    if ($orphan) { $s += " | launcher v$want has no folder" }
     [pscustomobject]@{
         Folder  = $ver
-        Bad     = ($x86 -gt 5 -or $main -eq '14C')
-        Summary = "v$($ver.Name) x86 files=$x86/$($files.Count) $($Product.Main)=$main"
+        Want    = $want
+        X86Bad  = ($x86 -gt 5 -or $main -eq '14C')
+        Bad     = ($x86 -gt 5 -or $main -eq '14C' -or $orphan)
+        Summary = $s
     }
 }
 
@@ -175,15 +184,18 @@ function Repair-Edge($Product, $State) {
     Save-SignedFile $url $msi
     Stop-EdgeServices
     Stop-Holders $Product.Root
-    if (-not (Move-BadFolder $State)) { $script:needBoot = $true; return }
+    # Only rename a folder that actually holds the broken files (not an older healthy one).
+    if ($State.Folder -and $State.X86Bad -and -not (Move-BadFolder $State)) { $script:needBoot = $true; return }
     $log = Join-Path $work 'edge-msi.log'
-    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" REINSTALL=ALL REINSTALLMODE=vamus /qn /norestart /l*v `"$log`"" -Wait -PassThru
-    Write-Output "  msiexec reinstall exit $($p.ExitCode)"
-    $after = Get-InstallState $Product
-    if (-not $after.Folder -or $after.Bad) {
-        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart /l*v `"$log.2`"" -Wait -PassThru
-        Write-Output "  msiexec install exit $($p.ExitCode)"
+    # REINSTALLMODE=amus: "a" rewrites every file even when the version already matches.
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" REINSTALL=ALL REINSTALLMODE=amus /qn /norestart /l*v `"$log`"" -Wait -PassThru
+    Write-Output "  msiexec forced reinstall exit $($p.ExitCode)"
+    $target = Join-Path $Product.Root "$($rel.ProductVersion)\$($Product.Main)"
+    if (-not (Test-Path $target)) {
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" ALLOWDOWNGRADE=1 REINSTALL=ALL REINSTALLMODE=amus /qn /norestart /l*v `"$log.2`"" -Wait -PassThru
+        Write-Output "  msiexec second attempt exit $($p.ExitCode)"
     }
+    Write-Output "  $($rel.ProductVersion) folder present: $(Test-Path $target)"
 }
 
 function Repair-WebView2($Product, $State) {
