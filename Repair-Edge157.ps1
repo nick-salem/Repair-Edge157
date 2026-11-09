@@ -28,6 +28,7 @@
 
     v5 (2026-11-09): WebView2 registered-version check and fresh-install fallback; never renames an
     older healthy WebView2 folder.
+    v6 (2026-11-09): downloads fall back from Invoke-WebRequest to BITS to curl.exe, two tries each.
 
     Run as Administrator or SYSTEM (RMM). Windows PowerShell 5.1 or later. x64 Windows only.
     Running it will close Edge and any app using WebView2 (Teams, Outlook...) on the PC
@@ -132,7 +133,30 @@ function Get-InstallState($Product) {
 }
 
 function Save-SignedFile([string]$Url, [string]$OutFile) {
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    # Three downloaders, two tries each: some networks break one client (TLS "decryption operation
+    # failed", connection reset mid-download) but not another. BITS also resumes large files.
+    $ok = $false
+    $tries = @(
+        @{ n = 'Invoke-WebRequest'; s = { Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop } },
+        @{ n = 'BITS';              s = { Start-BitsTransfer -Source $Url -Destination $OutFile -Priority Foreground -ErrorAction Stop } },
+        @{ n = 'curl.exe';          s = { & "$env:windir\System32\curl.exe" -sSfL --retry 3 --retry-delay 5 -o $OutFile $Url 2>&1 | Out-Null
+                                          if ($LASTEXITCODE -ne 0) { throw "curl exit $LASTEXITCODE" } } }
+    )
+    foreach ($t in $tries) {
+        for ($a = 1; $a -le 2 -and -not $ok; $a++) {
+            Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+            try {
+                & $t.s
+                if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 1MB) { $ok = $true }
+                else { throw 'download came back empty' }
+            } catch {
+                Write-Output "  download via $($t.n) failed (try $a): $($_.Exception.Message)"
+                Start-Sleep -Seconds 5
+            }
+        }
+        if ($ok) { if ($t.n -ne 'Invoke-WebRequest') { Write-Output "  downloaded via $($t.n)" }; break }
+    }
+    if (-not $ok) { throw "Could not download $Url (Invoke-WebRequest, BITS and curl.exe all failed)" }
     $sig = Get-AuthenticodeSignature $OutFile
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
         Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
