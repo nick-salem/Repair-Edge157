@@ -161,8 +161,10 @@ function Register-BootRepair {
 }
 
 function Repair-Edge($Product, $State) {
-    $rel = (Invoke-RestMethod 'https://edgeupdates.microsoft.com/api/products' -UseBasicParsing |
-        Where-Object Product -eq 'Stable').Releases |
+    # Windows PowerShell 5.1 passes the whole JSON array down the pipeline as one object,
+    # so unroll it with ForEach-Object before filtering to the Stable channel.
+    $feed = @(Invoke-RestMethod 'https://edgeupdates.microsoft.com/api/products' -UseBasicParsing)
+    $rel = ($feed | ForEach-Object { $_ } | Where-Object { $_.Product -eq 'Stable' }).Releases |
         Where-Object { $_.Platform -eq 'Windows' -and $_.Architecture -eq 'x64' } |
         Sort-Object { [version]$_.ProductVersion } -Descending | Select-Object -First 1
     $url = ($rel.Artifacts | Where-Object ArtifactName -eq 'msi' | Select-Object -First 1).Location
