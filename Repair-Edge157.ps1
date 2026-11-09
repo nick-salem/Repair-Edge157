@@ -32,6 +32,11 @@
 .PARAMETER CheckOnly
     Report only. Change nothing.
 
+.PARAMETER FromBootTask
+    Internal. Used by the one-time startup task the script registers when a folder is locked
+    by a running app and can't be renamed; the task finishes the repair before anyone signs in
+    and then removes itself.
+
 .EXAMPLE
     .\Repair-Edge157.ps1 -CheckOnly
     .\Repair-Edge157.ps1
@@ -42,7 +47,8 @@
     Exit codes: 0 = healthy or fixed, 1 = still broken after repair (or broken with -CheckOnly), 2 = not run as admin / unsupported.
 #>
 [CmdletBinding()]
-param([switch]$CheckOnly)
+param([switch]$CheckOnly, [switch]$FromBootTask)
+$script:needBoot = $false
 
 $ErrorActionPreference = 'Continue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -112,11 +118,46 @@ function Stop-Holders([string]$Dir) {
     }
 }
 
+$EdgeServices = 'edgeupdate', 'edgeupdatem', 'MicrosoftEdgeElevationService'
+$HostNames = 'msedge', 'msedgewebview2', 'msedge_proxy', 'identity_helper', 'ms-teams', 'olk', 'OUTLOOK',
+             'M365Copilot', 'Copilot', 'Widgets', 'WidgetService', 'Acrobat', 'AcroCEF', 'ChatGPT', 'SearchHost'
+
+function Stop-EdgeServices {
+    foreach ($s in $EdgeServices) { Stop-Service $s -Force -ErrorAction SilentlyContinue }
+    Get-Process MicrosoftEdgeUpdate -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 function Move-BadFolder($State) {
-    $target = "$($State.Folder.FullName).x86bad"
+    $src = $State.Folder.FullName
+    $target = "$src.x86bad"
     if (Test-Path $target) { $target = "$target-$(Get-Date -Format yyyyMMddHHmmss)" }
-    Rename-Item $State.Folder.FullName (Split-Path $target -Leaf) -ErrorAction Stop
-    Write-Output "  renamed bad folder to $(Split-Path $target -Leaf)"
+    for ($i = 1; $i -le 6; $i++) {
+        try {
+            Rename-Item $src (Split-Path $target -Leaf) -ErrorAction Stop
+            Write-Output "  renamed bad folder to $(Split-Path $target -Leaf)"
+            return $true
+        } catch {
+            Write-Output "  rename attempt $i failed (folder in use), closing apps and retrying"
+            Stop-EdgeServices
+            Stop-Holders $src
+            Get-Process -Name $HostNames -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds (3 * $i)
+        }
+    }
+    return $false
+}
+
+function Register-BootRepair {
+    # Folder stays locked: finish the repair at next startup, before anyone signs in. Runs once.
+    $dst = Join-Path $env:ProgramData 'Repair-Edge157\Repair-Edge157.ps1'
+    New-Item (Split-Path $dst) -ItemType Directory -Force | Out-Null
+    Copy-Item $PSCommandPath $dst -Force
+    $cmd = "-NoProfile -ExecutionPolicy Bypass -File `"$dst`" -FromBootTask"
+    $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $cmd
+    $trg = New-ScheduledTaskTrigger -AtStartup
+    $pr  = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName 'Repair-Edge157' -Action $act -Trigger $trg -Principal $pr -Force | Out-Null
+    Write-Output '  folder still locked: repair scheduled for next restart (task Repair-Edge157)'
 }
 
 function Repair-Edge($Product, $State) {
@@ -130,8 +171,9 @@ function Repair-Edge($Product, $State) {
     $msi = Join-Path $work 'MicrosoftEdgeEnterpriseX64.msi'
     Write-Output "  downloading Edge Stable x64 $($rel.ProductVersion)"
     Save-SignedFile $url $msi
+    Stop-EdgeServices
     Stop-Holders $Product.Root
-    Move-BadFolder $State
+    if (-not (Move-BadFolder $State)) { $script:needBoot = $true; return }
     $log = Join-Path $work 'edge-msi.log'
     $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" REINSTALL=ALL REINSTALLMODE=vamus /qn /norestart /l*v `"$log`"" -Wait -PassThru
     Write-Output "  msiexec reinstall exit $($p.ExitCode)"
@@ -146,8 +188,9 @@ function Repair-WebView2($Product, $State) {
     $exe = Join-Path $work 'MicrosoftEdgeWebView2RuntimeInstallerX64.exe'
     Write-Output '  downloading WebView2 Runtime Evergreen standalone x64'
     Save-SignedFile 'https://go.microsoft.com/fwlink/?linkid=2124701' $exe
+    Stop-EdgeServices
     Stop-Holders $State.Folder.FullName
-    Move-BadFolder $State
+    if (-not (Move-BadFolder $State)) { $script:needBoot = $true; return }
     $p = Start-Process $exe -ArgumentList '/silent /install' -Wait -PassThru
     Write-Output ("  installer exit 0x{0:X}" -f $p.ExitCode)
 }
@@ -195,7 +238,12 @@ if (Test-Path $edgeExe) {
     Remove-Item $prof -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+if ($FromBootTask) { Unregister-ScheduledTask -TaskName 'Repair-Edge157' -Confirm:$false -ErrorAction SilentlyContinue }
+elseif ($stillBad -and $script:needBoot) { Register-BootRepair }
+foreach ($s in $EdgeServices) { Start-Service $s -ErrorAction SilentlyContinue }
+
 Stop-Transcript | Out-Null
+if ($stillBad -and $script:needBoot -and -not $FromBootTask) { Write-Output 'RESULT: PENDING RESTART (repair finishes automatically at next startup)'; exit 1 }
 if ($stillBad) { Write-Output 'RESULT: STILL BROKEN (see log in %windir%\Temp\Repair-Edge157)'; exit 1 }
 Write-Output 'RESULT: FIXED or healthy'
 exit 0
